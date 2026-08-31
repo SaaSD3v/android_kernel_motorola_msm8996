@@ -1,0 +1,80 @@
+name: Apply paranoid Wi-Fi fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-paranoid-wifi.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Apply minimal source fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          commoncap = Path('security/commoncap.c')
+          text = commoncap.read_text()
+
+          old_include = '''#ifdef CONFIG_ANDROID_PARANOID_NETWORK\n#include <linux/android_aid.h>\n#endif'''
+          new_include = '''#include <linux/android_aid.h>'''
+          if text.count(old_include) != 1:
+              raise SystemExit(f'expected one guarded android_aid include, found {text.count(old_include)}')
+          text = text.replace(old_include, new_include, 1)
+
+          old_caps = '''#ifdef CONFIG_ANDROID_PARANOID_NETWORK\n\tif (cap == CAP_NET_RAW && in_egroup_p(AID_NET_RAW))\n\t\treturn 0;\n\tif (cap == CAP_NET_ADMIN && in_egroup_p(AID_NET_ADMIN))\n\t\treturn 0;\n#endif'''
+          new_caps = '''\t/* Preserve Android legacy network-group capabilities even with\n\t * CONFIG_ANDROID_PARANOID_NETWORK disabled for container networking. */\n\tif (cap == CAP_NET_RAW && in_egroup_p(AID_NET_RAW))\n\t\treturn 0;\n\tif (cap == CAP_NET_ADMIN && in_egroup_p(AID_NET_ADMIN))\n\t\treturn 0;'''
+          if text.count(old_caps) != 1:
+              raise SystemExit(f'expected one guarded legacy capability block, found {text.count(old_caps)}')
+          text = text.replace(old_caps, new_caps, 1)
+          commoncap.write_text(text)
+
+          config = Path('arch/arm64/configs/albus_defconfig')
+          cfg = config.read_text()
+          candidates = [
+              '# CONFIG_ANDROID_PARANOID_NETWORK is not set',
+              'CONFIG_ANDROID_PARANOID_NETWORK=y',
+              'CONFIG_ANDROID_PARANOID_NETWORK=n',
+          ]
+          present = [x for x in candidates if x in cfg]
+          if len(present) != 1:
+              raise SystemExit(f'expected exactly one paranoid config representation, got {present}')
+          cfg = cfg.replace(present[0], 'CONFIG_ANDROID_PARANOID_NETWORK=n', 1)
+          config.write_text(cfg)
+          PY
+
+      - name: Validate exact result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -qx 'CONFIG_ANDROID_PARANOID_NETWORK=n' arch/arm64/configs/albus_defconfig
+          ! grep -q '^# CONFIG_ANDROID_PARANOID_NETWORK is not set$' arch/arm64/configs/albus_defconfig
+          grep -q '^#include <linux/android_aid.h>$' security/commoncap.c
+          ! grep -q '^#ifdef CONFIG_ANDROID_PARANOID_NETWORK$' security/commoncap.c
+          grep -q 'AID_NET_RAW' security/commoncap.c
+          grep -q 'AID_NET_ADMIN' security/commoncap.c
+          git diff --check
+          git diff -- security/commoncap.c arch/arm64/configs/albus_defconfig
+
+      - name: Commit final tree fix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'SaaSD3v'
+          git config user.email 'saasd3v@users.noreply.github.com'
+          git rm .github/workflows/fix-paranoid-wifi.yml
+          git add security/commoncap.c arch/arm64/configs/albus_defconfig
+          git diff --cached --check
+          git commit -m 'fix CONFIG_ANDROID_PARANOID_NETWORK broken wifi'
+          git push origin HEAD:${GITHUB_REF_NAME}
